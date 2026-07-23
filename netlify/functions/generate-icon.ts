@@ -1,44 +1,38 @@
 import type { Handler } from "@netlify/functions";
-import { GoogleGenAI } from "@google/genai";
 
-// Reads GEMINI_API_KEYS="key1,key2,key3" (comma separated).
-// Falls back to single GEMINI_API_KEY if that's all you have set.
-function getGeminiKeys(): string[] {
-  const multi = process.env.GEMINI_API_KEYS;
+// Reads OPENAI_API_KEYS="key1,key2,key3" (comma separated).
+// Falls back to single OPENAI_API_KEY if that's all you have set.
+function getOpenAIKeys(): string[] {
+  const multi = process.env.OPENAI_API_KEYS;
   if (multi) {
     return multi.split(",").map((k) => k.trim()).filter(Boolean);
   }
-  const single = process.env.GEMINI_API_KEY;
+  const single = process.env.OPENAI_API_KEY;
   return single ? [single] : [];
 }
 
-function makeClient(apiKey: string) {
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
-}
-
-function isQuotaOrKeyError(err: any): boolean {
-  const msg = (err?.message || "").toLowerCase();
-  const status = err?.status || err?.code;
+function isQuotaOrKeyError(status: number, message: string): boolean {
+  const msg = (message || "").toLowerCase();
   return (
     status === 429 ||
+    status === 401 ||
     status === 403 ||
     msg.includes("quota") ||
     msg.includes("rate limit") ||
-    msg.includes("resource_exhausted") ||
-    msg.includes("permission") ||
+    msg.includes("insufficient_quota") ||
     msg.includes("invalid api key") ||
-    msg.includes("api key not valid")
+    msg.includes("incorrect api key")
   );
 }
 
-// Fallback Canvas Icon Generator when no key works
+// gpt-image-1 only supports these fixed sizes for a square icon use case.
+// "2K"/"4K" in the UI map to the best available square size — OpenAI's
+// image API doesn't currently offer true 2048/4096px output.
+function resolveSize(resolution: string): string {
+  return "1024x1024";
+}
+
+// Fallback Canvas Icon Generator when no key works / all keys fail
 function generateFallbackIconCanvas(
   prompt: string,
   style: string,
@@ -158,9 +152,7 @@ export const handler: Handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: "Prompt is required" }) };
     }
 
-    const keys = getGeminiKeys();
-    // Shuffle so repeated requests spread load across keys instead of
-    // always hammering the first one in the list.
+    const keys = getOpenAIKeys();
     const orderedKeys = [...keys].sort(() => Math.random() - 0.5);
 
     const stylePrompts: Record<string, string> = {
@@ -179,50 +171,57 @@ export const handler: Handler = async (event) => {
     const styleDesc = stylePrompts[style] || stylePrompts.flat;
     const fullPrompt = `${prompt}, ${styleDesc}, ${layoutPrompt}, professional microstock vector quality, isolated on clean white background, high resolution, top rating graphics asset.`;
 
-    let lastError: any = null;
+    const size = resolveSize(resolution);
+    let lastError: string | null = null;
 
     for (const key of orderedKeys) {
       try {
-        const ai = makeClient(key);
-        const response = await ai.models.generateContent({
-          model: "gemini-3.1-flash-image",
-          contents: { parts: [{ text: fullPrompt }] },
-          config: {
-            imageConfig: {
-              aspectRatio: "1:1",
-              imageSize: resolution === "4K" ? "4K" : resolution === "2K" ? "2K" : "1K",
-            },
+        const resp = await fetch("https://api.openai.com/v1/images/generations", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${key}`,
           },
+          body: JSON.stringify({
+            model: "gpt-image-1",
+            prompt: fullPrompt,
+            size,
+            n: 1,
+          }),
         });
 
-        const parts = response.candidates?.[0]?.content?.parts || [];
-        let imageUrl = "";
-        for (const part of parts) {
-          if (part.inlineData) {
-            imageUrl = `data:${part.inlineData.mimeType || "image/png"};base64,${part.inlineData.data}`;
-            break;
+        const data: any = await resp.json();
+
+        if (!resp.ok) {
+          const message = data?.error?.message || "OpenAI image request failed";
+          lastError = message;
+          if (isQuotaOrKeyError(resp.status, message)) {
+            continue; // try next key
           }
+          break; // non-recoverable error (e.g. bad prompt) — don't burn other keys
         }
 
-        if (imageUrl) {
+        const b64 = data?.data?.[0]?.b64_json;
+        if (b64) {
           return {
             statusCode: 200,
-            body: JSON.stringify({ success: true, imageUrl, fullPrompt, mode: "gemini" }),
+            body: JSON.stringify({
+              success: true,
+              imageUrl: `data:image/png;base64,${b64}`,
+              fullPrompt,
+              mode: "openai",
+            }),
           };
         }
+
+        lastError = "No image data returned from OpenAI";
       } catch (err: any) {
-        lastError = err;
-        if (isQuotaOrKeyError(err)) {
-          // Try the next key in the list
-          continue;
-        }
-        // Non-quota error (e.g. bad request) — no point retrying other keys
-        break;
+        lastError = err?.message || String(err);
       }
     }
 
     if (lastError) {
-      console.warn("All Gemini keys failed, falling back to vector SVG generator:", lastError?.message || lastError);
+      console.warn("All OpenAI keys failed, falling back to vector SVG generator:", lastError);
     }
 
     const fallbackUrl = generateFallbackIconCanvas(prompt, style, layout, resolution);
@@ -235,8 +234,8 @@ export const handler: Handler = async (event) => {
         mode: "fallback",
         notice:
           orderedKeys.length === 0
-            ? "No GEMINI_API_KEYS configured. Operating in local vector engine mode."
-            : "All Gemini API keys hit quota/errors. Operating in local vector engine mode.",
+            ? "No OPENAI_API_KEYS configured. Operating in local vector engine mode."
+            : `OpenAI request failed (${lastError}). Operating in local vector engine mode.`,
       }),
     };
   } catch (error: any) {
