@@ -1,9 +1,18 @@
 import type { Handler } from "@netlify/functions";
 import { GoogleGenAI } from "@google/genai";
 
-function getGenAIClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
+// Reads GEMINI_API_KEYS="key1,key2,key3" (comma separated).
+// Falls back to single GEMINI_API_KEY if that's all you have set.
+function getGeminiKeys(): string[] {
+  const multi = process.env.GEMINI_API_KEYS;
+  if (multi) {
+    return multi.split(",").map((k) => k.trim()).filter(Boolean);
+  }
+  const single = process.env.GEMINI_API_KEY;
+  return single ? [single] : [];
+}
+
+function makeClient(apiKey: string) {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -14,7 +23,22 @@ function getGenAIClient() {
   });
 }
 
-// Fallback Canvas Icon Generator when Gemini API key is missing or quota exceeded
+function isQuotaOrKeyError(err: any): boolean {
+  const msg = (err?.message || "").toLowerCase();
+  const status = err?.status || err?.code;
+  return (
+    status === 429 ||
+    status === 403 ||
+    msg.includes("quota") ||
+    msg.includes("rate limit") ||
+    msg.includes("resource_exhausted") ||
+    msg.includes("permission") ||
+    msg.includes("invalid api key") ||
+    msg.includes("api key not valid")
+  );
+}
+
+// Fallback Canvas Icon Generator when no key works
 function generateFallbackIconCanvas(
   prompt: string,
   style: string,
@@ -48,7 +72,6 @@ function generateFallbackIconCanvas(
   };
 
   const palette = styleColors[style] || styleColors.flat;
-
   let pathShape = "";
   const lower = prompt.toLowerCase();
 
@@ -135,7 +158,10 @@ export const handler: Handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: "Prompt is required" }) };
     }
 
-    const ai = getGenAIClient();
+    const keys = getGeminiKeys();
+    // Shuffle so repeated requests spread load across keys instead of
+    // always hammering the first one in the list.
+    const orderedKeys = [...keys].sort(() => Math.random() - 0.5);
 
     const stylePrompts: Record<string, string> = {
       outline: "minimalist vector icon, crisp thin black stroke outline, linear art style, clean uniform line width, white background, stock vector quality",
@@ -153,13 +179,14 @@ export const handler: Handler = async (event) => {
     const styleDesc = stylePrompts[style] || stylePrompts.flat;
     const fullPrompt = `${prompt}, ${styleDesc}, ${layoutPrompt}, professional microstock vector quality, isolated on clean white background, high resolution, top rating graphics asset.`;
 
-    if (ai) {
+    let lastError: any = null;
+
+    for (const key of orderedKeys) {
       try {
+        const ai = makeClient(key);
         const response = await ai.models.generateContent({
           model: "gemini-3.1-flash-image",
-          contents: {
-            parts: [{ text: fullPrompt }],
-          },
+          contents: { parts: [{ text: fullPrompt }] },
           config: {
             imageConfig: {
               aspectRatio: "1:1",
@@ -170,7 +197,6 @@ export const handler: Handler = async (event) => {
 
         const parts = response.candidates?.[0]?.content?.parts || [];
         let imageUrl = "";
-
         for (const part of parts) {
           if (part.inlineData) {
             imageUrl = `data:${part.inlineData.mimeType || "image/png"};base64,${part.inlineData.data}`;
@@ -184,9 +210,19 @@ export const handler: Handler = async (event) => {
             body: JSON.stringify({ success: true, imageUrl, fullPrompt, mode: "gemini" }),
           };
         }
-      } catch (geminiError: any) {
-        console.warn("Gemini Image API call failed, falling back to vector SVG generator:", geminiError?.message || geminiError);
+      } catch (err: any) {
+        lastError = err;
+        if (isQuotaOrKeyError(err)) {
+          // Try the next key in the list
+          continue;
+        }
+        // Non-quota error (e.g. bad request) — no point retrying other keys
+        break;
       }
+    }
+
+    if (lastError) {
+      console.warn("All Gemini keys failed, falling back to vector SVG generator:", lastError?.message || lastError);
     }
 
     const fallbackUrl = generateFallbackIconCanvas(prompt, style, layout, resolution);
@@ -197,9 +233,10 @@ export const handler: Handler = async (event) => {
         imageUrl: fallbackUrl,
         fullPrompt,
         mode: "fallback",
-        notice: !ai
-          ? "Operating in local vector engine mode. Set GEMINI_API_KEY in Netlify environment variables for photorealistic Gemini 3.1 AI generations."
-          : undefined,
+        notice:
+          orderedKeys.length === 0
+            ? "No GEMINI_API_KEYS configured. Operating in local vector engine mode."
+            : "All Gemini API keys hit quota/errors. Operating in local vector engine mode.",
       }),
     };
   } catch (error: any) {
