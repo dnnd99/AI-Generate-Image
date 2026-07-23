@@ -1,0 +1,6 @@
+{
+  "name": "Icon Studio AI Generator",
+  "description": "Generator ikon vektor microstock berbasis AI dengan batch mode, gaya visual, resolusi 1K-4K, dan ekspor instan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
