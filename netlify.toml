@@ -1,0 +1,19 @@
+[build]
+  command = "vite build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# So the frontend's existing fetch("/api/generate-icon") calls keep working
+# without editing any frontend code.
+[[redirects]]
+  from = "/api/generate-icon"
+  to = "/.netlify/functions/generate-icon"
+  status = 200
+
+[[redirects]]
+  from = "/api/generate-metadata"
+  to = "/.netlify/functions/generate-metadata"
+  status = 200
